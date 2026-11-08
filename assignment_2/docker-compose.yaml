@@ -1,11 +1,51 @@
+# Starts Airflow (webserver + scheduler). After `docker-compose up`, open http://localhost:8080  (login: admin / admin)
+x-airflow-common: &airflow-common
+  build: .
+  image: cs611-a2-airflow
+  environment:
+    - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
+    - AIRFLOW__CORE__FERNET_KEY=PAqBeGJLJTYFzVkOGHWIYXdLO7XdXz5yTdxAGJe9ezM=
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+  volumes:
+    - airflow_data:/opt/airflow            # Airflow's own database and logs
+    - ./dags:/opt/airflow/dags             # the DAG
+    - .:/opt/airflow/project               # code, data, datamart and model_bank (outputs appear on your machine)
+
 services:
-  jupyter:
-    build: .
-    container_name: jupyter_lab
+  # One-off step, run as root: the output folders may have been created by another container (as root),
+  # which would stop Airflow's unprivileged user from writing into them (PermissionError).
+  fix-permissions:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: >
+      /bin/bash -c "mkdir -p /opt/airflow/project/datamart /opt/airflow/project/model_bank &&
+      chmod -R a+rwX /opt/airflow/project/datamart /opt/airflow/project/model_bank"
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: >
+      /bin/bash -c "airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true"
+
+  airflow-webserver:
+    <<: *airflow-common
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
     ports:
-      - "8888:8888"
-    volumes:
-      - .:/app
-    environment:
-      - JUPYTER_ENABLE_LAB=yes
-    command: ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--notebook-dir=/app", "--ServerApp.token=''", "--ServerApp.disable_check_xsrf=True"]
+      - "8080:8080"
+    command: webserver
+
+  airflow-scheduler:
+    <<: *airflow-common
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
+      airflow-init:
+        condition: service_completed_successfully
+    command: scheduler
+
+volumes:
+  airflow_data:

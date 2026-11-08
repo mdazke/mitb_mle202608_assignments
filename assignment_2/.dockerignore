@@ -1,0 +1,7 @@
+.git
+data
+datamart
+model_bank
+eda/charts
+__pycache__
+*.ipynb

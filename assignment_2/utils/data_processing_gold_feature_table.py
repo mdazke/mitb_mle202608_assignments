@@ -4,9 +4,11 @@ from pyspark.sql.functions import col
 from pyspark.sql.types import IntegerType, FloatType
 
 
-def process_features_gold_table(snapshot_date_str, silver_attributes_directory, silver_financials_directory, silver_clickstream_directory, gold_feature_store_directory, spark):
+def process_features_gold_table(snapshot_date_str, silver_attributes_directory, silver_financials_directory, gold_feature_store_directory, spark):
     # snapshot_date is the loan application date. Every source is read from the SAME snapshot partition only,
-    # so nothing dated after the application (e.g. later clickstream months) can leak into the features.
+    # so nothing dated after the application can leak into the features.
+    # Clickstream is deliberately NOT used: it exists only for customers with labels, so every application from
+    # Jul 2024 onward would arrive without it and could not be scored consistently.
     suffix = snapshot_date_str.replace('-','_') + '.parquet'
 
     # connect to silver tables
@@ -18,15 +20,8 @@ def process_features_gold_table(snapshot_date_str, silver_attributes_directory, 
     df_financials = spark.read.parquet(filepath)
     print('loaded from:', filepath, 'row count:', df_financials.count())
 
-    filepath = silver_clickstream_directory + "silver_clickstream_" + suffix
-    df_clickstream = spark.read.parquet(filepath)
-    print('loaded from:', filepath, 'row count:', df_clickstream.count())
-
-    # combine: one row per loan application. Clickstream only exists for some customers, so left join and flag it
-    df_clickstream = df_clickstream.drop("snapshot_date").withColumn("has_clickstream", F.lit(1).cast(IntegerType()))
+    # combine: one row per loan application
     df = df_attributes.join(df_financials.drop("snapshot_date"), on="Customer_ID", how="inner")
-    df = df.join(df_clickstream, on="Customer_ID", how="left")
-    df = df.fillna(0, subset=["has_clickstream"])
 
     # augment data: join key to the label store, same format as loan_id in the loan management system
     df = df.withColumn("loan_id", F.concat(col("Customer_ID"), F.lit("_"), F.date_format(col("snapshot_date"), "yyyy_MM_dd")))
@@ -54,7 +49,19 @@ def process_features_gold_table(snapshot_date_str, silver_attributes_directory, 
     for ratio_name, (numerator, denominator) in ratio_map.items():
         df = df.withColumn(ratio_name, F.when(col(denominator) > 0, col(numerator) / col(denominator)).cast(FloatType()))
 
-    # order columns: keys first, then attributes, financials, clickstream
+    # augment data: a few interpretable affordability / borrowing-behaviour features.
+    # Row-wise arithmetic only: nothing is learned from the wider dataset, so it is safe to build in gold.
+    # repayment_ability: salary left after monthly loan repayments (null if either input is null)
+    df = df.withColumn("repayment_ability", (col("Monthly_Inhand_Salary") - col("Total_EMI_per_month")).cast(FloatType()))
+    # balance_to_debt: monthly cash left over relative to the debt owed (null when debt is null or 0)
+    df = df.withColumn("balance_to_debt", F.when(col("Outstanding_Debt") > 0, col("Monthly_Balance") / col("Outstanding_Debt")).cast(FloatType()))
+    # inquiries_per_loan: credit-seeking per loan held; +1 keeps customers with 0 loans defined instead of null
+    df = df.withColumn("inquiries_per_loan", (col("Num_Credit_Inquiries") / (col("Num_of_Loan") + 1)).cast(FloatType()))
+    # num_loan_types: how many distinct (specified) loan types the customer holds
+    typed_flags = [c for c in df.columns if c.startswith("loan_type_") and c != "loan_type_not_specified"]
+    df = df.withColumn("num_loan_types", sum([col(c) for c in typed_flags]).cast(IntegerType()))
+
+    # order columns: keys first, then attributes, financials
     key_columns = ["loan_id", "Customer_ID", "snapshot_date"]
     df = df.select(key_columns + [c for c in df.columns if c not in key_columns])
 

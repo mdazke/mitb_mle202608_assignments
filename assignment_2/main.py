@@ -105,14 +105,15 @@ df.show()
 
 
 # ---------------- feature store ----------------
-# attributes / financials are captured once per customer at loan application, clickstream is monthly
+# attributes / financials are captured once per customer at loan application.
+# Clickstream is left out on purpose: it exists only for labelled customers (applications up to Jun 2024),
+# so applications from Jul 2024 onward could not be scored consistently with it.
 feature_end_date_str = "2025-01-01"
 feature_dates_str_lst = generate_first_of_month_dates(start_date_str, feature_end_date_str)
 print(feature_dates_str_lst)
 
 # raw sources: name -> csv file
 feature_sources = {
-    "clickstream": "data/feature_clickstream.csv",
     "attributes": "data/features_attributes.csv",
     "financials": "data/features_financials.csv",
 }
@@ -131,17 +132,15 @@ for date_str in feature_dates_str_lst:
 
 
 # create silver datalake
-silver_clickstream_directory = "datamart/silver/clickstream/"
 silver_attributes_directory = "datamart/silver/attributes/"
 silver_financials_directory = "datamart/silver/financials/"
 
-for directory in [silver_clickstream_directory, silver_attributes_directory, silver_financials_directory]:
+for directory in [silver_attributes_directory, silver_financials_directory]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
 # run silver backfill
 for date_str in feature_dates_str_lst:
-    utils.data_processing_silver_feature_table.process_silver_clickstream_table(date_str, bronze_feature_directories["clickstream"], silver_clickstream_directory, spark)
     utils.data_processing_silver_feature_table.process_silver_attributes_table(date_str, bronze_feature_directories["attributes"], silver_attributes_directory, spark)
     utils.data_processing_silver_feature_table.process_silver_financials_table(date_str, bronze_feature_directories["financials"], silver_financials_directory, spark)
 
@@ -154,7 +153,7 @@ if not os.path.exists(gold_feature_store_directory):
 
 # run gold backfill
 for date_str in feature_dates_str_lst:
-    utils.data_processing_gold_feature_table.process_features_gold_table(date_str, silver_attributes_directory, silver_financials_directory, silver_clickstream_directory, gold_feature_store_directory, spark)
+    utils.data_processing_gold_feature_table.process_features_gold_table(date_str, silver_attributes_directory, silver_financials_directory, gold_feature_store_directory, spark)
 
 
 folder_path = gold_feature_store_directory
@@ -167,3 +166,10 @@ df_features.show()
 # sanity check: features join to labels 1:1 on loan_id (labels only exist for loans that reached 6 months on book)
 df_labels = spark.read.parquet(*[gold_label_store_directory+os.path.basename(f) for f in glob.glob(os.path.join(gold_label_store_directory, '*'))])
 print("labelled rows:", df_labels.count(), "matched to features:", df_labels.join(df_features, on="loan_id", how="inner").count())
+
+# sanity check: no clickstream columns, and the new engineered features are present
+new_features = ["repayment_ability", "balance_to_debt", "inquiries_per_loan", "num_loan_types"]
+assert not [c for c in df_features.columns if c.startswith("fe_") or c == "has_clickstream"], "clickstream should not be in the feature store"
+assert all(c in df_features.columns for c in new_features), "engineered features missing"
+print("feature columns:", len(df_features.columns))
+df_features.select(new_features).describe().show()
